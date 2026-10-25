@@ -1,0 +1,123 @@
+name: Gate 2 runner image inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-runner-tuple:
+    name: Exact public runner tuple
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - name: Verify Xcode, SDK and Simulator runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - <<'PY'
+          import json
+          import os
+          import platform
+          import re
+          import subprocess
+
+          def run(*arguments: str) -> str:
+              return subprocess.run(
+                  arguments,
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  env={
+                      "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                      "HOME": os.environ["HOME"],
+                      "LC_ALL": "C",
+                      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                      "TMPDIR": os.environ["RUNNER_TEMP"] + "/",
+                      "TZ": "UTC",
+                  },
+              ).stdout.strip()
+
+          exact_environment = {
+              "CI": "true",
+              "GITHUB_ACTIONS": "true",
+              "RUNNER_ARCH": "ARM64",
+              "RUNNER_ENVIRONMENT": "github-hosted",
+              "RUNNER_OS": "macOS",
+              "ImageOS": "macos27",
+          }
+          for key, expected in exact_environment.items():
+              if os.environ.get(key) != expected:
+                  raise SystemExit(f"runner identity mismatch: {key}")
+          image_version = os.environ.get("ImageVersion", "")
+          if re.fullmatch(r"[0-9]{8}\.[0-9]{4}\.[0-9]+", image_version) is None:
+              raise SystemExit("runner image version is malformed")
+          for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REPOSITORY_ID"):
+              if re.fullmatch(r"[0-9]+", os.environ.get(key, "")) is None:
+                  raise SystemExit(f"runner identity is incomplete: {key}")
+          if platform.machine() != "arm64":
+              raise SystemExit("runner machine architecture mismatch")
+
+          if run("/usr/bin/xcodebuild", "-version").splitlines() != [
+              "Xcode 27.0",
+              "Build version 27A266a",
+          ]:
+              raise SystemExit("Xcode identity mismatch")
+          for sdk in ("iphoneos", "iphonesimulator"):
+              if run("/usr/bin/xcrun", "--sdk", sdk, "--show-sdk-version") != "27.0":
+                  raise SystemExit(f"SDK version mismatch: {sdk}")
+
+          runtimes = json.loads(
+              run("/usr/bin/xcrun", "simctl", "list", "-j", "runtimes")
+          )["runtimes"]
+          matching_runtimes = [
+              runtime
+              for runtime in runtimes
+              if runtime.get("identifier")
+              == "com.apple.CoreSimulator.SimRuntime.iOS-27-0"
+          ]
+          if len(matching_runtimes) != 1:
+              raise SystemExit("exact iOS runtime is not unique")
+          runtime = matching_runtimes[0]
+          expected_runtime = {
+              "buildversion": "24A434",
+              "isAvailable": True,
+              "name": "iOS 27.0",
+              "platform": "iOS",
+              "supportedArchitectures": ["arm64"],
+              "version": "27.0",
+          }
+          for key, expected in expected_runtime.items():
+              if runtime.get(key) != expected:
+                  raise SystemExit(f"iOS runtime mismatch: {key}")
+
+          device_types = json.loads(
+              run("/usr/bin/xcrun", "simctl", "list", "-j", "devicetypes")
+          )["devicetypes"]
+          matching_types = [
+              device
+              for device in device_types
+              if device.get("identifier")
+              == "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro"
+          ]
+          if len(matching_types) != 1 or matching_types[0].get("name") != "iPhone 18 Pro":
+              raise SystemExit("iPhone 18 Pro device type mismatch")
+
+          safe_summary = {
+              "gate2Admission": "NOT_PROVEN",
+              "imageOS": "macos27",
+              "imageVersion": image_version,
+              "offlinePolicyVerified": "NOT_PROVEN",
+              "runnerArchitecture": "ARM64",
+              "runtimeBuild": "24A434",
+              "status": "PASS",
+              "xcodeBuild": "27A266a",
+          }
+          print(json.dumps(safe_summary, sort_keys=True, separators=(",", ":")))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Gate 2 runner inventory: PASS\n\n")
+              summary.write("Exact public runner/toolchain/Simulator tuple is available. ")
+              summary.write("Gate 2 admission and offline workload remain NOT_PROVEN.\n")
+          PY
