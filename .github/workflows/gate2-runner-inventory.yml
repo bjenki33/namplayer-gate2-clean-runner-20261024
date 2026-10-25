@@ -31,7 +31,7 @@ jobs:
                   stderr=subprocess.PIPE,
                   text=True,
                   env={
-                      "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                      "DEVELOPER_DIR": "/Applications/Xcode_27.0.app/Contents/Developer",
                       "HOME": os.environ["HOME"],
                       "LC_ALL": "C",
                       "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
