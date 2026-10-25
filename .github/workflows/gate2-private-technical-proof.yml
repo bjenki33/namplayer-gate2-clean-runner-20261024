@@ -1,0 +1,703 @@
+name: Gate 2 private technical proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_request_id:
+        description: Authenticated 64-hex Gate 2 request ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate2-private-technical-proof
+  cancel-in-progress: false
+
+jobs:
+  technical-proof:
+    name: Exact private technical proof
+    runs-on: xcode-27
+    environment: gate2-private
+    timeout-minutes: 180
+    env:
+      GATE2_BROKER_URL: ${{ secrets.GATE2_BROKER_URL }}
+      GATE2_BROKER_TOKEN: ${{ secrets.GATE2_BROKER_TOKEN }}
+      GATE2_TRANSFER_HMAC_KEY: ${{ secrets.GATE2_TRANSFER_HMAC_KEY }}
+      GATE2_SESSION_ID: ${{ secrets.GATE2_SESSION_ID }}
+      GATE2_RUNNER_CMS_IDENTITY_B64: ${{ secrets.GATE2_RUNNER_CMS_IDENTITY_B64 }}
+      GATE2_OUTPUT_CMS_CERT_B64: ${{ secrets.GATE2_OUTPUT_CMS_CERT_B64 }}
+      GATE2_EXPECTED_REQUEST_ID: ${{ inputs.expected_request_id }}
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    steps:
+      - name: Receive, verify, execute and return encrypted proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          NP_STAGE=initialization
+          NP_TRANSFER_ROOT="$RUNNER_TEMP/gate2-private-transfer"
+          NP_SECRET_ROOT="$NP_TRANSFER_ROOT/secrets"
+          NP_INPUT_ROOT="$NP_TRANSFER_ROOT/inputs"
+          NP_WORK="$NP_TRANSFER_ROOT/work"
+          NP_RETURN_ROOT="$NP_TRANSFER_ROOT/return"
+          NP_PACKAGE_ROOT="$NP_TRANSFER_ROOT/package"
+          NP_UPLOADED=0
+          NP_SUCCESS=0
+
+          mkdir -m 700 "$NP_TRANSFER_ROOT" "$NP_SECRET_ROOT" "$NP_INPUT_ROOT" \
+            "$NP_RETURN_ROOT" "$NP_PACKAGE_ROOT"
+
+          for NP_REQUIRED in \
+            GATE2_BROKER_URL GATE2_BROKER_TOKEN GATE2_TRANSFER_HMAC_KEY \
+            GATE2_SESSION_ID GATE2_RUNNER_CMS_IDENTITY_B64 \
+            GATE2_OUTPUT_CMS_CERT_B64 GATE2_EXPECTED_REQUEST_ID
+          do
+            if [[ -z "${!NP_REQUIRED:-}" ]]; then
+              echo "required private transport input is absent" >&2
+              exit 2
+            fi
+          done
+
+          /usr/bin/python3 -I - <<'PY'
+          import os
+          import re
+          from urllib.parse import urlsplit
+
+          session = os.environ["GATE2_SESSION_ID"]
+          request = os.environ["GATE2_EXPECTED_REQUEST_ID"]
+          hmac_key = os.environ["GATE2_TRANSFER_HMAC_KEY"]
+          bearer = os.environ["GATE2_BROKER_TOKEN"]
+          if re.fullmatch(r"[0-9a-f]{64}", session) is None:
+              raise SystemExit("session identifier is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", request) is None:
+              raise SystemExit("request identifier is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", hmac_key) is None:
+              raise SystemExit("transfer HMAC key is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", bearer) is None:
+              raise SystemExit("broker bearer token is invalid")
+          parsed = urlsplit(os.environ["GATE2_BROKER_URL"])
+          if (
+              parsed.scheme != "https"
+              or parsed.username is not None
+              or parsed.password is not None
+              or parsed.port is not None
+              or parsed.path not in ("", "/")
+              or parsed.query
+              or parsed.fragment
+              or parsed.hostname is None
+              or not parsed.hostname.endswith(".trycloudflare.com")
+          ):
+              raise SystemExit("broker URL is not one exact Quick Tunnel origin")
+          PY
+          GATE2_BROKER_URL="${GATE2_BROKER_URL%/}"
+
+          NP_STAGE=runner-identity
+          /usr/bin/python3 -I - <<'PY'
+          import json
+          import os
+          import platform
+          import re
+          import subprocess
+
+          exact_environment = {
+              "CI": "true",
+              "GITHUB_ACTIONS": "true",
+              "RUNNER_ARCH": "ARM64",
+              "RUNNER_ENVIRONMENT": "github-hosted",
+              "RUNNER_OS": "macOS",
+              "ImageOS": "macos27",
+          }
+          for key, expected in exact_environment.items():
+              if os.environ.get(key) != expected:
+                  raise SystemExit(f"runner identity mismatch: {key}")
+          image_version = os.environ.get("ImageVersion", "")
+          if re.fullmatch(r"[0-9]{8}\.[0-9]{4}\.[0-9]+", image_version) is None:
+              raise SystemExit("runner image version is malformed")
+          for key in (
+              "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REPOSITORY_ID",
+              "GITHUB_ACTOR_ID",
+          ):
+              if re.fullmatch(r"[0-9]+", os.environ.get(key, "")) is None:
+                  raise SystemExit(f"runner identity is incomplete: {key}")
+          if platform.machine() != "arm64":
+              raise SystemExit("runner machine architecture mismatch")
+
+          command_environment = {
+              "DEVELOPER_DIR": "/Applications/Xcode_27.0.app/Contents/Developer",
+              "HOME": os.environ["HOME"],
+              "LC_ALL": "C",
+              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+              "TMPDIR": os.environ["RUNNER_TEMP"] + "/",
+              "TZ": "UTC",
+          }
+
+          def run(*arguments):
+              return subprocess.run(
+                  arguments,
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  env=command_environment,
+              ).stdout.strip()
+
+          if run("/usr/bin/xcodebuild", "-version").splitlines() != [
+              "Xcode 27.0",
+              "Build version 27A266a",
+          ]:
+              raise SystemExit("Xcode identity mismatch")
+          for sdk in ("iphoneos", "iphonesimulator"):
+              if run("/usr/bin/xcrun", "--sdk", sdk, "--show-sdk-version") != "27.0":
+                  raise SystemExit(f"SDK version mismatch: {sdk}")
+          runtimes = json.loads(run("/usr/bin/xcrun", "simctl", "list", "-j", "runtimes"))["runtimes"]
+          matching_runtimes = [
+              value for value in runtimes
+              if value.get("identifier") == "com.apple.CoreSimulator.SimRuntime.iOS-27-0"
+          ]
+          if len(matching_runtimes) != 1:
+              raise SystemExit("exact iOS runtime is not unique")
+          runtime = matching_runtimes[0]
+          for key, expected in {
+              "buildversion": "24A434",
+              "isAvailable": True,
+              "name": "iOS 27.0",
+              "platform": "iOS",
+              "supportedArchitectures": ["arm64"],
+              "version": "27.0",
+          }.items():
+              if runtime.get(key) != expected:
+                  raise SystemExit(f"iOS runtime mismatch: {key}")
+          devices = json.loads(run("/usr/bin/xcrun", "simctl", "list", "-j", "devicetypes"))["devicetypes"]
+          matching_devices = [
+              value for value in devices
+              if value.get("identifier") == "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro"
+          ]
+          if len(matching_devices) != 1 or matching_devices[0].get("name") != "iPhone 18 Pro":
+              raise SystemExit("iPhone 18 Pro device type mismatch")
+          PY
+
+          printf '%s' "$GATE2_BROKER_TOKEN" > "$NP_SECRET_ROOT/bearer-token"
+          printf '%s\n' "$GATE2_TRANSFER_HMAC_KEY" > "$NP_SECRET_ROOT/hmac-key.hex"
+          printf 'header = "Authorization: Bearer %s"\n' "$GATE2_BROKER_TOKEN" \
+            > "$NP_SECRET_ROOT/curl-auth.cfg"
+          printf '%s' "$GATE2_RUNNER_CMS_IDENTITY_B64" | /usr/bin/base64 -D \
+            > "$NP_SECRET_ROOT/runner-cms-identity.pem"
+          printf '%s' "$GATE2_OUTPUT_CMS_CERT_B64" | /usr/bin/base64 -D \
+            > "$NP_SECRET_ROOT/mac-return-cert.pem"
+          chmod 600 "$NP_SECRET_ROOT"/*
+          /usr/bin/openssl x509 -in "$NP_SECRET_ROOT/mac-return-cert.pem" -noout >/dev/null
+
+          unset GATE2_BROKER_TOKEN GATE2_TRANSFER_HMAC_KEY \
+            GATE2_RUNNER_CMS_IDENTITY_B64 GATE2_OUTPUT_CMS_CERT_B64
+
+          fetch_input() {
+            local NP_NAME="$1"
+            local NP_DESTINATION="$2"
+            local NP_HEADERS="$NP_INPUT_ROOT/$NP_NAME.headers"
+            /usr/bin/curl --fail --silent --show-error \
+              --config "$NP_SECRET_ROOT/curl-auth.cfg" \
+              --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --connect-timeout 30 --max-time 900 \
+              --header 'Cache-Control: no-store' \
+              --dump-header "$NP_HEADERS" \
+              --output "$NP_DESTINATION" \
+              "$GATE2_BROKER_URL/v1/$GATE2_SESSION_ID/input/$NP_NAME"
+            /usr/bin/python3 -I - \
+              "$NP_SECRET_ROOT/hmac-key.hex" "$GATE2_SESSION_ID" "$NP_NAME" \
+              "$NP_HEADERS" "$NP_DESTINATION" \
+              "$NP_SECRET_ROOT/mac-return-cert.pem" <<'PY'
+          import hashlib
+          import hmac
+          from pathlib import Path
+          import re
+          import sys
+
+          key_path, session, name, headers_path, body_path, return_cert_path = sys.argv[1:]
+          key_text = Path(key_path).read_text(encoding="ascii").strip()
+          if re.fullmatch(r"[0-9a-f]{64}", key_text) is None:
+              raise SystemExit("transfer HMAC key is invalid")
+          raw = Path(headers_path).read_text(encoding="iso-8859-1")
+          blocks = [block for block in raw.replace("\r\n", "\n").split("\n\n") if block]
+          blocks = [block for block in blocks if block.startswith("HTTP/")]
+          if not blocks:
+              raise SystemExit("broker response headers are missing")
+          lines = blocks[-1].splitlines()
+          if re.fullmatch(r"HTTP/[0-9.]+ 200(?: .*)?", lines[0]) is None:
+              raise SystemExit("broker response status is invalid")
+          fields = {}
+          for line in lines[1:]:
+              field, separator, value = line.partition(":")
+              if not separator:
+                  raise SystemExit("broker response header is malformed")
+              key = field.strip().lower()
+              if key in {
+                  "x-gate2-ciphertext-sha256",
+                  "x-gate2-ciphertext-hmac-sha256",
+                  "x-gate2-return-certificate-sha256",
+              }:
+                  if key in fields:
+                      raise SystemExit("broker response has a duplicate authenticated header")
+                  fields[key] = value.strip()
+          expected_sha = fields.get("x-gate2-ciphertext-sha256", "")
+          expected_hmac = fields.get("x-gate2-ciphertext-hmac-sha256", "")
+          expected_return_cert = fields.get("x-gate2-return-certificate-sha256", "")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+              raise SystemExit("broker ciphertext hash header is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_hmac) is None:
+              raise SystemExit("broker ciphertext HMAC header is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_return_cert) is None:
+              raise SystemExit("broker return-certificate hash header is invalid")
+          actual_return_cert = hashlib.sha256(Path(return_cert_path).read_bytes()).hexdigest()
+          if not hmac.compare_digest(actual_return_cert, expected_return_cert):
+              raise SystemExit("return certificate is not bound to the transfer session")
+          data = Path(body_path).read_bytes()
+          actual_sha = hashlib.sha256(data).hexdigest()
+          context = (
+              f"gate2-input-v1\n{session}\n{name}\n{actual_return_cert}\n"
+              f"{actual_sha}\n{len(data)}\n"
+          ).encode("ascii")
+          actual_hmac = hmac.new(bytes.fromhex(key_text), context + data, hashlib.sha256).hexdigest()
+          if not hmac.compare_digest(actual_sha, expected_sha):
+              raise SystemExit("broker ciphertext SHA-256 mismatch")
+          if not hmac.compare_digest(actual_hmac, expected_hmac):
+              raise SystemExit("broker ciphertext HMAC mismatch")
+          PY
+            rm -f "$NP_HEADERS"
+          }
+
+          decrypt_input() {
+            local NP_NAME="$1"
+            local NP_DESTINATION="$2"
+            /usr/bin/openssl cms -decrypt -binary -inform DER \
+              -in "$NP_INPUT_ROOT/$NP_NAME.cms" \
+              -recip "$NP_SECRET_ROOT/runner-cms-identity.pem" \
+              -inkey "$NP_SECRET_ROOT/runner-cms-identity.pem" \
+              -out "$NP_DESTINATION"
+          }
+
+          upload_return() {
+            local NP_PLAINTEXT_TAR="$1"
+            local NP_CIPHERTEXT="$NP_RETURN_ROOT/OUTPUT.cms"
+            local NP_CHUNK_ROOT="$NP_RETURN_ROOT/chunks"
+            /usr/bin/openssl cms -encrypt -binary -aes256 \
+              -in "$NP_PLAINTEXT_TAR" -outform DER -out "$NP_CIPHERTEXT" \
+              "$NP_SECRET_ROOT/mac-return-cert.pem" || return 2
+            mkdir -m 700 "$NP_CHUNK_ROOT" || return 2
+            /usr/bin/split -b 33554432 -d -a 4 "$NP_CIPHERTEXT" "$NP_CHUNK_ROOT/" \
+              || return 2
+            local NP_PARTS=("$NP_CHUNK_ROOT"/*)
+            [[ -f "${NP_PARTS[0]}" ]] || return 2
+            local NP_TOTAL
+            NP_TOTAL=${#NP_PARTS[@]}
+            if [[ "$NP_TOTAL" -lt 1 || "$NP_TOTAL" -gt 32 ]]; then
+              echo "encrypted return exceeds its chunk bound" >&2
+              return 2
+            fi
+            local NP_INDEX=0
+            while [[ "$NP_INDEX" -lt "$NP_TOTAL" ]]; do
+              local NP_PART
+              NP_PART=$(printf '%s/%04d' "$NP_CHUNK_ROOT" "$NP_INDEX") || return 2
+              local NP_SHA NP_SIZE NP_MAC
+              NP_SHA=$(/usr/bin/shasum -a 256 "$NP_PART" | /usr/bin/awk '{print $1}') \
+                || return 2
+              NP_SIZE=$(/usr/bin/stat -f '%z' "$NP_PART") || return 2
+              NP_MAC=$(/usr/bin/python3 -I - \
+                "$NP_SECRET_ROOT/hmac-key.hex" "$GATE2_SESSION_ID" \
+                "$NP_INDEX" "$NP_TOTAL" "$NP_SHA" "$NP_SIZE" "$NP_PART" <<'PY'
+          import hashlib
+          import hmac
+          from pathlib import Path
+          import sys
+
+          key_path, session, index, total, digest, size, path = sys.argv[1:]
+          data = Path(path).read_bytes()
+          context = (
+              f"gate2-output-chunk-v1\n{session}\n{int(index):04d}-of-{int(total):04d}\n"
+              f"{digest}\n{size}\n"
+          ).encode("ascii")
+          print(hmac.new(bytes.fromhex(Path(key_path).read_text().strip()), context + data, hashlib.sha256).hexdigest())
+          PY
+              ) || return 2
+              /usr/bin/curl --fail --silent --show-error \
+                --config "$NP_SECRET_ROOT/curl-auth.cfg" \
+                --proto '=https' --tlsv1.2 --max-redirs 0 \
+                --connect-timeout 30 --max-time 900 \
+                --header "X-Gate2-Total-Chunks: $NP_TOTAL" \
+                --header "X-Gate2-Chunk-SHA256: $NP_SHA" \
+                --header "X-Gate2-Chunk-HMAC-SHA256: $NP_MAC" \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'Expect:' \
+                --data-binary "@$NP_PART" \
+                "$GATE2_BROKER_URL/v1/$GATE2_SESSION_ID/output/$(printf '%04d' "$NP_INDEX")" \
+                >/dev/null || return 2
+              NP_INDEX=$((NP_INDEX + 1))
+            done
+            NP_UPLOADED=1
+            return 0
+          }
+
+          package_and_return() {
+            local NP_EXIT_CODE="$?"
+            trap - EXIT
+            set -e
+            if [[ "$NP_UPLOADED" -eq 1 || ! -s "$NP_SECRET_ROOT/mac-return-cert.pem" ]]; then
+              exit "$NP_EXIT_CODE"
+            fi
+            local NP_OUT="$NP_PACKAGE_ROOT/gate2-output"
+            mkdir -m 700 "$NP_OUT"
+            if [[ "$NP_SUCCESS" -eq 1 ]]; then
+              /bin/cp -R "$NP_EVIDENCE_ROOT" "$NP_OUT/evidence"
+              /bin/cp "$NP_RESULT" "$NP_OUT/RESULT.json"
+              /bin/cp "$NP_ATTESTATION" "$NP_OUT/RUNNER-ATTESTATION.json"
+              /bin/cp "$NP_EVALUATOR_RECEIPT" "$NP_OUT/EVALUATOR-RECEIPT.json"
+              /usr/bin/python3 -I - "$NP_OUT/TRANSPORT-STATUS.json" "$GATE2_SESSION_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          Path(sys.argv[1]).write_text(json.dumps({
+              "schemaVersion": 1,
+              "classification": "gate2-private-transport-status",
+              "sessionID": sys.argv[2],
+              "status": "PASS",
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          PY
+            else
+              /usr/bin/python3 -I - "$NP_OUT/FAILURE.json" "$GATE2_SESSION_ID" "$NP_STAGE" "$NP_EXIT_CODE" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          stage = sys.argv[3]
+          if re.fullmatch(r"[a-z0-9-]{1,48}", stage) is None:
+              stage = "unknown"
+          Path(sys.argv[1]).write_text(json.dumps({
+              "schemaVersion": 1,
+              "classification": "gate2-private-transport-failure",
+              "sessionID": sys.argv[2],
+              "stage": stage,
+              "exitCode": int(sys.argv[4]),
+              "status": "FAIL",
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          PY
+              if [[ -f "${NP_EVIDENCE_ROOT:-/nonexistent}/FAILURE.json" \
+                && ! -L "$NP_EVIDENCE_ROOT/FAILURE.json" ]]; then
+                /usr/bin/python3 -I - \
+                  "$NP_EVIDENCE_ROOT/FAILURE.json" "$NP_OUT/TECHNICAL-FAILURE.json" \
+                  "$GATE2_EXPECTED_REQUEST_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          expected_request_id = sys.argv[3]
+          if source.stat().st_size > 65536:
+              raise SystemExit("technical failure receipt is oversized")
+          def no_duplicates(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError("duplicate key")
+                  value[key] = item
+              return value
+          value = json.loads(source.read_text(encoding="utf-8"), object_pairs_hook=no_duplicates)
+          if set(value) != {
+              "classification", "status", "requestID", "stage", "errorType",
+              "commandFailure",
+          }:
+              raise SystemExit("technical failure receipt fields are invalid")
+          if value["classification"] != "gate2-fresh-technical-proof-failure" or value["status"] != "FAIL":
+              raise SystemExit("technical failure receipt classification is invalid")
+          if value["requestID"] != expected_request_id:
+              raise SystemExit("technical failure receipt request binding is invalid")
+          allowed_stages = {
+              "initialization", "handoff-and-input-verification", "runner-toolchain",
+              "openpgp-source-authenticity", "fresh-candidate-app-scenarios",
+              "replacement-candidate", "full-ci", "sanitizers",
+              "security-preflight", "legacy-relink-replay", "closure-bindings",
+              "final-evaluation",
+          }
+          if value["stage"] not in allowed_stages:
+              raise SystemExit("technical failure stage is invalid")
+          if not isinstance(value["errorType"], str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9._]{0,127}", value["errorType"]) is None:
+              raise SystemExit("technical failure type is invalid")
+          command = value["commandFailure"]
+          if command is not None:
+              if not isinstance(command, dict) or set(command) != {
+                  "stage", "status", "reason", "commandSHA256", "outputSHA256",
+                  "outputBytes", "elapsedNanoseconds", "exitCode",
+              }:
+                  raise SystemExit("technical command failure fields are invalid")
+              if (
+                  not isinstance(command["stage"], str)
+                  or not 1 <= len(command["stage"]) <= 128
+                  or any(ord(character) < 32 or ord(character) > 126 for character in command["stage"])
+                  or command["status"] != "FAIL"
+                  or command["reason"] not in {"EXECUTION_ERROR", "TIMEOUT_OR_BOUND", "UNEXPECTED_EXIT"}
+                  or re.fullmatch(r"[0-9a-f]{64}", command["commandSHA256"] or "") is None
+                  or re.fullmatch(r"[0-9a-f]{64}", command["outputSHA256"] or "") is None
+                  or isinstance(command["outputBytes"], bool)
+                  or not isinstance(command["outputBytes"], int)
+                  or not 0 <= command["outputBytes"] <= 33554432
+                  or isinstance(command["elapsedNanoseconds"], bool)
+                  or not isinstance(command["elapsedNanoseconds"], int)
+                  or not 0 <= command["elapsedNanoseconds"] <= 86400000000000
+                  or isinstance(command["exitCode"], bool)
+                  or not isinstance(command["exitCode"], int)
+                  or not -255 <= command["exitCode"] <= 255
+              ):
+                  raise SystemExit("technical command failure value is invalid")
+          destination.write_text(
+              json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          PY
+              fi
+              /usr/bin/python3 -I - "$NP_OUT/TRANSPORT-STATUS.json" "$GATE2_SESSION_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          Path(sys.argv[1]).write_text(json.dumps({
+              "schemaVersion": 1,
+              "classification": "gate2-private-transport-status",
+              "sessionID": sys.argv[2],
+              "status": "FAIL",
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          PY
+            fi
+            /usr/bin/python3 -I - "$NP_OUT" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          root = Path(sys.argv[1])
+          count = 0
+          total = 0
+          for current, directories, files in os.walk(root, followlinks=False):
+              for name in directories + files:
+                  path = Path(current) / name
+                  if path.is_symlink():
+                      raise SystemExit("return closure contains a symlink")
+                  mode = path.stat().st_mode
+                  if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                      raise SystemExit("return closure contains a special file")
+              for name in files:
+                  path = Path(current) / name
+                  count += 1
+                  total += path.stat().st_size
+          if count < 2 or count > 4096 or total > 536870912:
+              raise SystemExit("return closure exceeds its bound")
+          PY
+            COPYFILE_DISABLE=1 /usr/bin/tar --no-xattrs -czf "$NP_RETURN_ROOT/gate2-output.tar.gz" \
+              -C "$NP_PACKAGE_ROOT" gate2-output
+            if ! upload_return "$NP_RETURN_ROOT/gate2-output.tar.gz"; then
+              echo "encrypted return upload failed" >&2
+              exit 3
+            fi
+            exit "$NP_EXIT_CODE"
+          }
+          trap package_and_return EXIT
+
+          NP_STAGE=receive-inputs
+          for NP_NAME in handoff bootstrap receipt gpgv; do
+            fetch_input "$NP_NAME" "$NP_INPUT_ROOT/$NP_NAME.cms"
+          done
+          decrypt_input handoff "$NP_INPUT_ROOT/handoff.tar.gz"
+          decrypt_input bootstrap "$NP_INPUT_ROOT/bootstrap.tar.gz"
+          decrypt_input receipt "$NP_INPUT_ROOT/prepare-receipt.json"
+          decrypt_input gpgv "$NP_INPUT_ROOT/gpgv"
+          chmod 500 "$NP_INPUT_ROOT/gpgv"
+          rm -f "$NP_SECRET_ROOT/runner-cms-identity.pem" "$NP_INPUT_ROOT"/*.cms
+
+          NP_STAGE=bootstrap-verification
+          NP_BOOTSTRAP="$NP_TRANSFER_ROOT/bootstrap-runner"
+          /usr/bin/python3 -I - "$NP_INPUT_ROOT/bootstrap.tar.gz" "$NP_BOOTSTRAP" <<'PY'
+          import io
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import sys
+          import tarfile
+
+          archive = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          expected = {
+              "bootstrap-runner/README.md",
+              "bootstrap-runner/contract.json",
+              "bootstrap-runner/handoff.py",
+              "bootstrap-runner/result-template.json",
+          }
+          with tarfile.open(archive, "r:gz") as source:
+              members = [member for member in source.getmembers() if member.name.rstrip("/") != "bootstrap-runner"]
+              if len(members) != len(expected) or {member.name for member in members} != expected:
+                  raise SystemExit("bootstrap archive closure mismatch")
+              if any(not member.isfile() or member.issym() or member.islnk() for member in members):
+                  raise SystemExit("bootstrap archive member type is invalid")
+              output.mkdir(mode=0o700)
+              for member in members:
+                  if member.size < 1 or member.size > 16777216:
+                      raise SystemExit("bootstrap archive member size is invalid")
+                  relative = PurePosixPath(member.name).relative_to("bootstrap-runner")
+                  if len(relative.parts) != 1:
+                      raise SystemExit("bootstrap path is invalid")
+                  stream = source.extractfile(member)
+                  if stream is None:
+                      raise SystemExit("bootstrap member is unreadable")
+                  data = stream.read(member.size + 1)
+                  if len(data) != member.size:
+                      raise SystemExit("bootstrap member changed during read")
+                  destination = output / relative.name
+                  descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                  try:
+                      view = memoryview(data)
+                      while view:
+                          written = os.write(descriptor, view)
+                          if written <= 0:
+                              raise SystemExit("bootstrap extraction did not make progress")
+                          view = view[written:]
+                  finally:
+                      os.close(descriptor)
+          PY
+
+          /usr/bin/python3 -I - \
+            "$NP_INPUT_ROOT/prepare-receipt.json" "$NP_BOOTSTRAP" \
+            "$NP_INPUT_ROOT/handoff.tar.gz" "$NP_INPUT_ROOT/gpgv" \
+            "$GATE2_EXPECTED_REQUEST_ID" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          receipt_path, runner_path, archive_path, gpgv_path = map(Path, sys.argv[1:5])
+          expected_request_id = sys.argv[5]
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+          expected = receipt["bootstrapRunnerFiles"]
+          if set(expected) != {"README.md", "contract.json", "handoff.py", "result-template.json"}:
+              raise SystemExit("bootstrap receipt closure mismatch")
+
+          def record(path):
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit("bootstrap input is not a regular file")
+              data = path.read_bytes()
+              return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+          if any(record(runner_path / name) != value for name, value in expected.items()):
+              raise SystemExit("bootstrap runner file mismatch")
+          if record(runner_path / "contract.json")["sha256"] != receipt["contractSHA256"]:
+              raise SystemExit("bootstrap contract mismatch")
+          if record(archive_path)["sha256"] != receipt["archiveSHA256"]:
+              raise SystemExit("handoff archive mismatch")
+          if receipt["requestID"] != expected_request_id:
+              raise SystemExit("authenticated request ID mismatch")
+          contract = json.loads((runner_path / "contract.json").read_text(encoding="utf-8"))
+          expected_gpgv = contract["publicBindings"]["gate2Part1"]["gpgvExecutableSHA256"]
+          if record(gpgv_path)["sha256"] != expected_gpgv:
+              raise SystemExit("pinned gpgv mismatch")
+          PY
+
+          NP_ARCHIVE_SHA256=$(/usr/bin/python3 -I -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["archiveSHA256"])' \
+            "$NP_INPUT_ROOT/prepare-receipt.json")
+          NP_EXPECTED_REQUEST_ID=$(/usr/bin/python3 -I -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["requestID"])' \
+            "$NP_INPUT_ROOT/prepare-receipt.json")
+
+          NP_STAGE=bootstrap
+          /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" bootstrap \
+            --archive "$NP_INPUT_ROOT/handoff.tar.gz" \
+            --archive-sha256 "$NP_ARCHIVE_SHA256" \
+            --output "$NP_WORK"
+          /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" verify \
+            --handoff "$NP_WORK/handoff" >/dev/null
+
+          NP_SOURCE="$NP_WORK/source"
+          NP_HANDOFF="$NP_WORK/handoff"
+          NP_KIT="$NP_WORK/relink-kit"
+          NP_TECHNICAL_WORK="$NP_WORK/technical-work"
+          NP_EVIDENCE_ROOT="$NP_WORK/evidence"
+          NP_RESULT="$NP_WORK/RESULT.json"
+          NP_ATTESTATION="$NP_WORK/RUNNER-ATTESTATION.json"
+          NP_EVALUATOR_RECEIPT="$NP_WORK/EVALUATOR-RECEIPT.json"
+
+          NP_STAGE=runner-attestation
+          /usr/bin/python3 -I - "$NP_ATTESTATION" "$NP_EXPECTED_REQUEST_ID" <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          request_id = sys.argv[2]
+          value = {
+              "schemaVersion": 2,
+              "classification": "gate2-clean-runner-attestation",
+              "requestID": request_id,
+              "runnerClassification": "fresh-ephemeral-runner",
+              "runnerImageID": "github-hosted-macos27-" + os.environ["ImageVersion"].replace(".", "-"),
+              "workflowID": (
+                  "github-run-" + os.environ["GITHUB_RUN_ID"] + "-"
+                  + os.environ["GITHUB_RUN_ATTEMPT"] + "-repo-"
+                  + os.environ["GITHUB_REPOSITORY_ID"]
+              ),
+              "operatorID": "github-actor:" + os.environ["GITHUB_ACTOR_ID"],
+              "repositoryID": os.environ["GITHUB_REPOSITORY_ID"],
+              "commitSHA": os.environ["GITHUB_SHA"],
+              "workflowRef": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflowSHA": os.environ["GITHUB_WORKFLOW_SHA"],
+              "eventName": os.environ["GITHUB_EVENT_NAME"],
+              "gitRef": os.environ["GITHUB_REF"],
+              "issuedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "freshnessStatement": "no-prior-namplayer-state;manifested-inputs-only;fresh-workspace;networkless-lgpl-candidate;owned-loopback-tests",
+          }
+          output.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          PY
+
+          NP_STAGE=technical-driver
+          mkdir -m 700 "$NP_TRANSFER_ROOT/isolated-home" "$NP_TRANSFER_ROOT/isolated-tmp"
+          env -i \
+            HOME="$NP_TRANSFER_ROOT/isolated-home" \
+            TMPDIR="$NP_TRANSFER_ROOT/isolated-tmp/" \
+            PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            TZ=UTC LC_ALL=C \
+            DEVELOPER_DIR="$DEVELOPER_DIR" \
+            CI="$CI" GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ARCH="$RUNNER_ARCH" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_OS="$RUNNER_OS" ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
+            GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
+            GITHUB_WORKFLOW_REF="$GITHUB_WORKFLOW_REF" \
+            GITHUB_WORKFLOW_SHA="$GITHUB_WORKFLOW_SHA" GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_REF="$GITHUB_REF" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_ACTOR_ID="$GITHUB_ACTOR_ID" \
+            /usr/bin/python3 -I \
+              "$NP_SOURCE/Scripts/Gate2CleanRunner/run-technical-proof.py" \
+              --source "$NP_SOURCE" \
+              --handoff "$NP_HANDOFF" \
+              --trusted-handoff "$NP_BOOTSTRAP/handoff.py" \
+              --expected-request-id "$NP_EXPECTED_REQUEST_ID" \
+              --kit "$NP_KIT" \
+              --gpgv "$NP_INPUT_ROOT/gpgv" \
+              --runner-attestation "$NP_ATTESTATION" \
+              --work-root "$NP_TECHNICAL_WORK" \
+              --evidence-root "$NP_EVIDENCE_ROOT" \
+              --result "$NP_RESULT" \
+              >"$NP_TRANSFER_ROOT/technical-driver.stdout" \
+              2>"$NP_TRANSFER_ROOT/technical-driver.stderr"
+
+          NP_STAGE=technical-evaluation
+          /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" evaluate \
+            --handoff "$NP_HANDOFF" \
+            --result "$NP_RESULT" \
+            --evidence-manifest "$NP_EVIDENCE_ROOT/MANIFEST.json" \
+            --runner-attestation "$NP_ATTESTATION" \
+            --expected-request-id "$NP_EXPECTED_REQUEST_ID" \
+            --scope technical > "$NP_EVALUATOR_RECEIPT"
+
+          NP_SUCCESS=1
+          NP_STAGE=return-proof
