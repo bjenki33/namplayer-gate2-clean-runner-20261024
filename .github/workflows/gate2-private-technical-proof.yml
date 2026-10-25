@@ -693,10 +693,13 @@ jobs:
             "$NP_INPUT_ROOT/prepare-receipt.json")
 
           NP_STAGE=bootstrap
-          /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" bootstrap \
-            --archive "$NP_INPUT_ROOT/handoff.tar.gz" \
-            --archive-sha256 "$NP_ARCHIVE_SHA256" \
-            --output "$NP_WORK"
+          (
+            umask 022
+            /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" bootstrap \
+              --archive "$NP_INPUT_ROOT/handoff.tar.gz" \
+              --archive-sha256 "$NP_ARCHIVE_SHA256" \
+              --output "$NP_WORK"
+          )
           /usr/bin/python3 -I "$NP_BOOTSTRAP/handoff.py" verify \
             --handoff "$NP_WORK/handoff" >/dev/null
 
