@@ -245,6 +245,7 @@ jobs:
                 --header "X-Gate2-Chunk-HMAC-SHA256: $NP_MAC" \
                 --header 'Content-Type: application/octet-stream' \
                 --header 'Expect:' \
+                --request PUT \
                 --data-binary "@$NP_PART" \
                 "$GATE2_BROKER_URL/v1/$GATE2_SESSION_ID/output/$(printf '%04d' "$NP_INDEX")" \
                 >/dev/null || return 2
