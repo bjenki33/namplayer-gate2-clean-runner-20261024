@@ -380,6 +380,50 @@ jobs:
                   /bin/rm -f "$NP_OUT/TECHNICAL-FAILURE.json"
                 fi
               fi
+              if [[ -f "$NP_OUT/TECHNICAL-FAILURE.json" \
+                && -f "${NP_EVIDENCE_ROOT:-/nonexistent}/OBSERVER-DIAGNOSTIC.json" \
+                && -n "${NP_TRUSTED_HANDOFF_SHA:-}" ]]; then
+                if ! /usr/bin/python3 -I - \
+                  "$NP_BOOTSTRAP/handoff.py" "$NP_TRUSTED_HANDOFF_SHA" \
+                  "$NP_EVIDENCE_ROOT/OBSERVER-DIAGNOSTIC.json" \
+                  "$NP_OUT/OBSERVER-DIAGNOSTIC.json" "$GATE2_EXPECTED_REQUEST_ID" \
+                  > "$NP_TRANSFER_ROOT/observer-return-validation.log" 2>&1 <<'PY'
+          import argparse
+          import hashlib
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import types
+
+          verifier_path = Path(sys.argv[1])
+          flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+          descriptor = os.open(verifier_path, flags)
+          try:
+              before = os.fstat(descriptor)
+              if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 4194304:
+                  raise SystemExit("observer verifier is not a bounded regular file")
+              with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                  source = stream.read(4194305)
+              after = os.fstat(descriptor)
+              identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+              if identity(before) != identity(after) or len(source) != before.st_size:
+                  raise SystemExit("observer verifier changed while reading")
+          finally:
+              os.close(descriptor)
+          if hashlib.sha256(source).hexdigest() != sys.argv[2]:
+              raise SystemExit("observer verifier no longer matches authenticated bootstrap")
+          verifier = types.ModuleType("gate2_authenticated_observer_verifier")
+          verifier.__file__ = str(verifier_path)
+          exec(compile(source, str(verifier_path), "exec"), verifier.__dict__)
+          verifier.observer_diagnostic_cli(argparse.Namespace(
+              input=sys.argv[3], output=sys.argv[4], expected_request_id=sys.argv[5],
+          ))
+          PY
+                then
+                  /bin/rm -f "$NP_OUT/OBSERVER-DIAGNOSTIC.json"
+                fi
+              fi
               /usr/bin/python3 -I - "$NP_OUT/TRANSPORT-STATUS.json" "$GATE2_SESSION_ID" <<'PY'
           import json
           from pathlib import Path
@@ -651,7 +695,7 @@ jobs:
           /usr/bin/python3 -I - \
             "$NP_INPUT_ROOT/prepare-receipt.json" "$NP_BOOTSTRAP" \
             "$NP_INPUT_ROOT/handoff.tar.gz" "$NP_GPGV" \
-            "$GATE2_EXPECTED_REQUEST_ID" <<'PY'
+            "$GATE2_EXPECTED_REQUEST_ID" "$NP_SECRET_ROOT/bootstrap-handoff-sha256" <<'PY'
           import hashlib
           import json
           from pathlib import Path
@@ -683,7 +727,10 @@ jobs:
           expected_gpgv = contract["publicBindings"]["gate2Part1"]["gpgvExecutableSHA256"]
           if record(gpgv_path)["sha256"] != expected_gpgv:
               raise SystemExit("pinned gpgv mismatch")
+          Path(sys.argv[6]).write_text(expected["handoff.py"]["sha256"] + "\n", encoding="ascii")
           PY
+          read -r NP_TRUSTED_HANDOFF_SHA < "$NP_SECRET_ROOT/bootstrap-handoff-sha256"
+          readonly NP_TRUSTED_HANDOFF_SHA
 
           NP_ARCHIVE_SHA256=$(/usr/bin/python3 -I -c \
             'import json,sys; print(json.load(open(sys.argv[1]))["archiveSHA256"])' \
