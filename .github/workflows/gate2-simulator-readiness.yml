@@ -1,0 +1,69 @@
+name: Gate 2 Simulator readiness diagnostic
+
+on:
+  push:
+    branches:
+      - codex/gate2-readiness-20261026
+    paths:
+      - Scripts/simulator-readiness.py
+      - .github/workflows/gate2-simulator-readiness.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate2-readiness-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  readiness:
+    name: Readiness (${{ matrix.mode }})
+    runs-on: xcode-27
+    timeout-minutes: 22
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [legacy-context, native-context]
+    env:
+      NP_MODE: ${{ matrix.mode }}
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    steps:
+      - name: Run owned synthetic Simulator readiness diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          NP_SCRIPT="$RUNNER_TEMP/simulator-readiness.py"
+          NP_RECEIPT="$RUNNER_TEMP/readiness-receipt.log"
+          NP_STDERR="$RUNNER_TEMP/readiness-private.stderr"
+          /usr/bin/curl --fail --silent --show-error \
+            --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --connect-timeout 15 --max-time 60 \
+            --output "$NP_SCRIPT" \
+            "https://raw.githubusercontent.com/bjenki33/namplayer-gate2-clean-runner-20261024/$GITHUB_SHA/Scripts/simulator-readiness.py"
+          NP_ACTUAL=$(/usr/bin/shasum -a 256 "$NP_SCRIPT" | /usr/bin/awk '{print $1}')
+          if [[ "$NP_ACTUAL" != "c3f915a65fcd2265e34342891b143ac3f90e3d26817a67e69ac11dcb78185fd0" ]]; then
+            echo 'readiness diagnostic script hash mismatch' >&2
+            exit 2
+          fi
+          NP_RC=0
+          /usr/bin/python3 -I "$NP_SCRIPT" \
+            --mode "$NP_MODE" \
+            --work-root "$RUNNER_TEMP/namplayer-readiness-work" \
+            >"$NP_RECEIPT" 2>"$NP_STDERR" || NP_RC=$?
+          /usr/bin/python3 -I - "$NP_RECEIPT" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          payload = Path(sys.argv[1]).read_bytes()
+          prefix = b"READINESS-RECEIPT "
+          if len(payload) > 128 * 1024 or not payload.startswith(prefix) or payload.count(b"\n") != 1:
+              raise SystemExit("diagnostic receipt framing invalid")
+          value = json.loads(payload[len(prefix):])
+          if value.get("classification") != "gate2-synthetic-simulator-readiness":
+              raise SystemExit("diagnostic receipt classification invalid")
+          if value.get("scope") != "environment-diagnostic-only":
+              raise SystemExit("diagnostic receipt scope invalid")
+          print(payload.decode("ascii"), end="")
+          PY
+          exit "$NP_RC"
