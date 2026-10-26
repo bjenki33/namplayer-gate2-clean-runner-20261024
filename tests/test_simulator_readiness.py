@@ -377,6 +377,31 @@ class SimulatorReadinessTests(unittest.TestCase):
         self.assertEqual(receipt["primaryFailure"], {"stage": "host-preflight", "reason": "HOST_MISMATCH"})
         self.assertNotIn(str(self.root), line)
 
+    def test_native_policy_loader_rejects_changed_bytes_before_execution(self) -> None:
+        policy = self.root / "substituted-policy.py"
+        policy.write_text("raise AssertionError('must not execute')\n", encoding="ascii")
+        with self.assertRaises(readiness.DiagnosticFailure) as mismatch:
+            readiness.load_native_policy_environment(policy)
+        self.assertEqual(mismatch.exception.reason, "POLICY_HASH_MISMATCH")
+        linked = self.root / "linked-policy.py"
+        linked.symlink_to(policy)
+        with self.assertRaises(readiness.DiagnosticFailure) as symlink:
+            readiness.load_native_policy_environment(linked)
+        self.assertEqual(symlink.exception.reason, "POLICY_FILE_INVALID")
+
+    def test_exact_native_policy_ignores_overridden_parent_context(self) -> None:
+        developer = self.root / "synthetic-developer"
+        developer.mkdir()
+        policy = SCRIPT.with_name("native_simulator_environment.py")
+        with (
+            mock.patch.object(readiness, "DEVELOPER", str(developer)),
+            mock.patch.dict(os.environ, {"HOME": "/synthetic-overridden-home", "TMPDIR": "/synthetic-overridden-temp", "CFFIXED_USER_HOME": "/synthetic-overridden-cf"}, clear=True),
+        ):
+            environment = readiness.load_native_policy_environment(policy)
+        self.assertEqual(environment["HOME"], readiness.pwd.getpwuid(os.geteuid()).pw_dir)
+        self.assertEqual(environment["TMPDIR"], os.confstr(65537))
+        self.assertNotIn("CFFIXED_USER_HOME", environment)
+
 
 if __name__ == "__main__":
     unittest.main()

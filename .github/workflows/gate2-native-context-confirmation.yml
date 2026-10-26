@@ -1,0 +1,78 @@
+name: Gate 2 native context cold confirmation
+
+on:
+  push:
+    branches:
+      - codex/gate2-native-context-20261026
+    paths:
+      - Scripts/simulator-readiness.py
+      - Scripts/native_simulator_environment.py
+      - .github/workflows/gate2-native-context-confirmation.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate2-native-context-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  confirmation:
+    name: Native policy from isolated parent
+    runs-on: xcode-27
+    timeout-minutes: 22
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    steps:
+      - name: Confirm exact native policy on a fresh Simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          NP_SCRIPT="$RUNNER_TEMP/native-context-confirmation.py"
+          NP_POLICY="$RUNNER_TEMP/native_simulator_environment.py"
+          NP_RECEIPT="$RUNNER_TEMP/native-context-receipt.log"
+          NP_STDERR="$RUNNER_TEMP/native-context-private.stderr"
+          NP_ORIGIN="https://raw.githubusercontent.com/bjenki33/namplayer-gate2-clean-runner-20261024/$GITHUB_SHA/Scripts"
+          /usr/bin/curl --fail --silent --show-error \
+            --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --connect-timeout 15 --max-time 60 \
+            --output "$NP_SCRIPT" "$NP_ORIGIN/simulator-readiness.py"
+          /usr/bin/curl --fail --silent --show-error \
+            --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --connect-timeout 15 --max-time 60 \
+            --output "$NP_POLICY" "$NP_ORIGIN/native_simulator_environment.py"
+          NP_SCRIPT_HASH=$(/usr/bin/shasum -a 256 "$NP_SCRIPT" | /usr/bin/awk '{print $1}')
+          NP_POLICY_HASH=$(/usr/bin/shasum -a 256 "$NP_POLICY" | /usr/bin/awk '{print $1}')
+          if [[ "$NP_SCRIPT_HASH" != "dbd76fba96c15aab8d086514c54b90ff077e4afab7f879bfc7c4bc7f26b7463b" || \
+                "$NP_POLICY_HASH" != "4c4dcef41aebf75ac96268912f2de40e6a07775ab0c4ca92fb70e280a878c798" ]]; then
+            echo 'native context source hash mismatch' >&2
+            exit 2
+          fi
+          mkdir -m 700 "$RUNNER_TEMP/overridden-home" "$RUNNER_TEMP/overridden-temp"
+          NP_RC=0
+          HOME="$RUNNER_TEMP/overridden-home" \
+          CFFIXED_USER_HOME="$RUNNER_TEMP/overridden-home" \
+          TMPDIR="$RUNNER_TEMP/overridden-temp/" \
+            /usr/bin/python3 -I "$NP_SCRIPT" --mode native-context \
+              --native-policy "$NP_POLICY" \
+              --work-root "$RUNNER_TEMP/namplayer-native-confirmation-work" \
+              >"$NP_RECEIPT" 2>"$NP_STDERR" || NP_RC=$?
+          /usr/bin/python3 -I - "$NP_RECEIPT" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          payload = Path(sys.argv[1]).read_bytes()
+          prefix = b"READINESS-RECEIPT "
+          if len(payload) > 128 * 1024 or not payload.startswith(prefix) or payload.count(b"\n") != 1:
+              raise SystemExit("confirmation receipt framing invalid")
+          value = json.loads(payload[len(prefix):])
+          if value.get("classification") != "gate2-synthetic-simulator-readiness" or value.get("scope") != "environment-diagnostic-only":
+              raise SystemExit("confirmation receipt identity invalid")
+          if value.get("nativeEnvironmentPolicySHA256") != "4c4dcef41aebf75ac96268912f2de40e6a07775ab0c4ca92fb70e280a878c798":
+              raise SystemExit("confirmation policy binding invalid")
+          if value.get("parentContext") != {"homeOverridden": True, "temporaryOverridden": True, "cfHomeOverridePresent": True}:
+              raise SystemExit("confirmation parent context not exercised")
+          print(payload.decode("ascii"), end="")
+          PY
+          exit "$NP_RC"

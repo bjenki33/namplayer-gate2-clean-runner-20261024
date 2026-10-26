@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ MAIN_BUDGET = 900
 CLEANUP_BUDGET = 180
 UUID_RE = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 MODES = ("legacy-context", "native-context")
+NATIVE_POLICY_SHA256 = "4c4dcef41aebf75ac96268912f2de40e6a07775ab0c4ca92fb70e280a878c798"
 
 
 class DiagnosticFailure(Exception):
@@ -36,6 +38,19 @@ class DiagnosticFailure(Exception):
         super().__init__(reason)
         self.stage = stage
         self.reason = reason
+
+
+def load_native_policy_environment(path: Path) -> dict[str, str]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise DiagnosticFailure("native-policy", "POLICY_FILE_INVALID")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != NATIVE_POLICY_SHA256:
+        raise DiagnosticFailure("native-policy", "POLICY_HASH_MISMATCH")
+    spec = importlib.util.spec_from_file_location("confirmed_native_simulator_policy", path)
+    if spec is None or spec.loader is None:
+        raise DiagnosticFailure("native-policy", "POLICY_LOAD_FAILED")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.native_environment(Path(DEVELOPER))
 
 
 def live_group_members(group: int) -> bool | None:
@@ -395,6 +410,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
+    parser.add_argument("--native-policy", type=Path)
     arguments = parser.parse_args()
     receipt = {"schemaVersion": 1, "classification": "gate2-synthetic-simulator-readiness",
                "scope": "environment-diagnostic-only", "mode": arguments.mode,
@@ -407,7 +423,8 @@ def main() -> int:
                 or os.environ.get("GITHUB_ACTIONS") != "true"
                 or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
                 or os.environ.get("ImageOS") != "macos27" or image != IMAGE_VERSION
-                or Path(os.environ.get("HOME", "")).resolve() != native_home.resolve()):
+                or (arguments.native_policy is None and
+                    Path(os.environ.get("HOME", "")).resolve() != native_home.resolve())):
             raise DiagnosticFailure("host-preflight", "HOST_MISMATCH")
         root = arguments.work_root
         if not root.is_absolute() or os.path.lexists(root):
@@ -415,9 +432,14 @@ def main() -> int:
         root.mkdir(mode=0o700)
         for name in ("TechnicalHome", "TechnicalTemp", "RuntimeHome", "RuntimeTemp"):
             (root / name).mkdir(mode=0o700)
-        native = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": DEVELOPER,
-                  "HOME": str(native_home), "TMPDIR": os.environ["TMPDIR"],
-                  "LC_ALL": "C", "LANG": "C", "TZ": "UTC"}
+        if arguments.native_policy is None:
+            native = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": DEVELOPER,
+                      "HOME": str(native_home), "TMPDIR": os.environ["TMPDIR"],
+                      "LC_ALL": "C", "LANG": "C", "TZ": "UTC"}
+        else:
+            if arguments.mode != "native-context":
+                raise DiagnosticFailure("native-policy", "POLICY_MODE_INVALID")
+            native = load_native_policy_environment(arguments.native_policy)
         version = invoke(["/usr/bin/xcodebuild", "-version"], native, 30)
         if version["reason"] != "COMPLETED" or version["payload"].strip() != b"Xcode 27.0\nBuild version 27A266a":
             raise DiagnosticFailure("host-preflight", "XCODE_MISMATCH")
@@ -429,6 +451,13 @@ def main() -> int:
         if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
             raise DiagnosticFailure("host-preflight", "SOURCE_COMMIT_INVALID")
         receipt = Diagnostic(arguments.mode, root, native).run()
+        if arguments.native_policy is not None:
+            receipt["nativeEnvironmentPolicySHA256"] = NATIVE_POLICY_SHA256
+            receipt["parentContext"] = {
+                "homeOverridden": Path(os.environ.get("HOME", "")).resolve() != Path(native["HOME"]).resolve(),
+                "temporaryOverridden": Path(os.environ.get("TMPDIR", "")).resolve() != Path(native["TMPDIR"]).resolve(),
+                "cfHomeOverridePresent": "CFFIXED_USER_HOME" in os.environ,
+            }
         receipt["sourceCommit"] = source_commit
         receipt["host"] = {"runnerImageVersion": image, "imageOS": "macos27",
                            "architecture": "arm64", "xcodeVersion": "27.0",

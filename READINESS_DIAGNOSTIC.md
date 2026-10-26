@@ -36,3 +36,14 @@ Run local non-Simulator checks with:
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+## Native policy cold confirmation
+
+The `codex/gate2-native-context-20261026` branch runs one fresh diagnostic job
+with the byte-identical OS-account resolver used by the application repository's
+Gate 2 executors. Both script and resolver SHA-256 are pinned before execution.
+The parent deliberately supplies isolated HOME, TMPDIR and CFFIXED_USER_HOME;
+the resolver derives native HOME/temp independently from the OS. The receipt
+binds the resolver digest and records only booleans about these parent overrides.
+This is one cold readiness confirmation, not a full application/dependency proof.
+The original A/B workflow branch and main remain unchanged.
